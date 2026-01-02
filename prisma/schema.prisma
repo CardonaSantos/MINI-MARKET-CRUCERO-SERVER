@@ -483,8 +483,7 @@ model PrecioProducto {
 
 enum RolPrecio {
   PUBLICO
-  AGROSERVICIO
-  FINCA
+  NOVA
   DISTRIBUIDOR
   PROMOCION
 }

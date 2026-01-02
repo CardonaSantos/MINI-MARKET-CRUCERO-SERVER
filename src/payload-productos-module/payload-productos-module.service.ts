@@ -7,7 +7,7 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { Prisma, PrismaClient } from '@prisma/client';
-import { ProductoRaw } from './interfaces';
+import { ProductoJsonRaw, ProductoRaw } from './interfaces';
 import { rawPayloadDataProducts } from 'src/assets/productos';
 
 function trimOrNull(v: unknown): string | null {
@@ -117,104 +117,79 @@ export class PayloadProductosModuleService {
   private readonly logger = new Logger(PayloadProductosModuleService.name);
   constructor(private readonly prisma: PrismaService) {}
 
-  //retorno producto creado
   /**
-   * Crea/actualiza 1 producto completo (producto + tipoPresentacion + categorias + precios)
-   * en UNA transacción. Retorna el id del producto.
+   * Asegura que existan las sucursales base antes de cargar stock.
+   */
+  private async ensureSucursales(tx: PrismaClient | Prisma.TransactionClient) {
+    const sucursalesData = [
+      { id: 1, nombre: 'Sucursal Principal', tipo: 'TIENDA' },
+      { id: 2, nombre: 'Sucursal San Marcos', tipo: 'TIENDA' },
+      { id: 3, nombre: 'Sucursal San Antonio', tipo: 'TIENDA' },
+    ];
+
+    for (const suc of sucursalesData) {
+      await tx.sucursal.upsert({
+        where: { id: suc.id },
+        create: {
+          id: suc.id, // Forzamos el ID
+          nombre: suc.nombre,
+          tipoSucursal: 'TIENDA', // Enum default
+          direccion: 'Dirección pendiente',
+          estadoOperacion: true,
+        },
+        update: {
+          // Si ya existe, solo actualizamos el nombre por si cambió
+          nombre: suc.nombre,
+        },
+      });
+    }
+    this.logger.log('🏢 Sucursales verificadas/creadas (Ids: 1, 2, 3)');
+  }
+
+  /**
+   * Procesa 1 producto con todas sus relaciones (Categorias, Precios, Stock Multi-Sucursal)
    */
   private async upsertProductoTx(
     tx: PrismaClient | Prisma.TransactionClient,
-    p: ProductoRaw,
-    sucursalId: number,
+    p: ProductoJsonRaw,
   ): Promise<number> {
-    // -------- Validaciones mínimas
-    const codigoProducto = trimOrNull(p.codigoproducto);
+    // 1. Validaciones y limpieza básica
+    const codigoProducto = trimOrNull(p.codigo);
     const nombre = trimOrNull(p.nombre);
     const descripcion = trimOrNull(p.descripcion);
-    const tipoEmpaque = trimOrNull(p.tipoempaque);
-    const categorias = splitCategorias(p.categorias);
-    const stockMinimo = parseEntero(p.stockminimo, 0);
-    let codigoProveedor = normalizeProveedorCode(p.codigoproveedor);
+    const costo = p.costo || 0;
 
-    const stockActual = parseEntero(p.stockactual, 0);
-    const fechaVencimiento = parseDate(p.stockvencimiento);
-
-    if (codigoProveedor) {
-      // Optimización: Usar findFirst en lugar de findUnique si codigoProveedor no es @unique en schema
-      const holder = await tx.producto.findFirst({
-        where: { codigoProveedor },
-        select: { id: true, codigoProducto: true },
-      });
-
-      if (holder && holder.codigoProducto !== codigoProducto) {
-        this.logger.warn(
-          `codigoProveedor duplicado "${codigoProveedor}" en prod "${codigoProducto}". Pertenece a "${holder.codigoProducto}". Se guardará NULL.`,
-        );
-        codigoProveedor = null;
-      }
+    if (!codigoProducto || !nombre) {
+      throw new BadRequestException(
+        `Falta código o nombre en producto: ${JSON.stringify(p)}`,
+      );
     }
 
-    if (!codigoProducto) throw new BadRequestException('Falta codigoproducto');
-    if (!nombre)
-      throw new BadRequestException(`Falta nombre para ${codigoProducto}`);
-
-    const costo = parseMoney(p.preciocosto);
-    if (costo === null)
-      throw new BadRequestException(`Costo inválido para ${codigoProducto}`);
-
-    // -------- Upsert del producto base
     const producto = await tx.producto.upsert({
       where: { codigoProducto },
       create: {
         codigoProducto,
         nombre,
-        descripcion: descripcion ?? undefined,
-        codigoProveedor: codigoProveedor ?? undefined,
-        precioCostoActual: costo, // Asegurar Decimal
-        stockThreshold: {
-          create: { stockMinimo },
-        },
+        descripcion,
+        precioCostoActual: costo,
       },
       update: {
         nombre,
-        descripcion: descripcion ?? undefined,
-        // Si codigoProveedor es null, lo desconectamos (set: null) o no hacemos nada
-        ...(codigoProveedor !== undefined ? { codigoProveedor } : {}),
+        descripcion,
         precioCostoActual: costo,
-
-        // CORRECCIÓN CRÍTICA 1: Usar upsert anidado para evitar error si ya existe el threshold
-        stockThreshold: {
-          upsert: {
-            create: { stockMinimo },
-            update: { stockMinimo },
-          },
-        },
       },
       select: { id: true },
     });
 
-    // -------- Tipo de empaque
-    if (tipoEmpaque) {
-      await tx.tipoPresentacion.upsert({
-        where: { nombre: tipoEmpaque },
-        create: {
-          nombre: tipoEmpaque,
-          activo: true,
-          productos: { connect: { id: producto.id } },
-        },
-        update: {
-          productos: { connect: { id: producto.id } },
-        },
-      });
-    }
+    if (p.categorias && p.categorias.length > 0) {
+      for (const catNombre of p.categorias) {
+        const nombreLimpio = catNombre.trim();
+        if (!nombreLimpio) continue;
 
-    // -------- Categorías
-    if (categorias.length > 0) {
-      for (const cat of categorias) {
         await tx.categoria.upsert({
-          where: { nombre: cat },
+          where: { nombre: nombreLimpio },
           create: {
-            nombre: cat,
+            nombre: nombreLimpio,
             productos: { connect: { id: producto.id } },
           },
           update: {
@@ -224,73 +199,72 @@ export class PayloadProductosModuleService {
       }
     }
 
-    // -------- Precios
-    if (Array.isArray(p.precios) && p.precios.length > 0) {
-      await tx.precioProducto.deleteMany({
-        where: {
-          productoId: producto.id,
-          tipo: 'ESTANDAR',
-        },
-      });
+    // 4. Precios (Array de números, ordenados de mayor a menor)
+    // Borramos precios anteriores "ESTANDAR" para evitar duplicados al re-correr el script
+    await tx.precioProducto.deleteMany({
+      where: {
+        productoId: producto.id,
+        tipo: 'ESTANDAR',
+      },
+    });
 
+    if (p.precios && p.precios.length > 0) {
       let orden = 1;
-
-      for (const pr of p.precios) {
-        const valor = parseMoney(pr.precio);
-        if (valor === null) {
-          this.logger.warn(
-            `Precio inválido (${pr.precio}) rol=${pr.rol} producto=${codigoProducto}`,
-          );
-          continue;
-        }
-
+      for (const precioValor of p.precios) {
         await tx.precioProducto.create({
           data: {
             productoId: producto.id,
-            precio: ensurePrecioDecimal(valor),
-            rol: pr.rol,
+            precio: ensurePrecioDecimal(precioValor),
             tipo: 'ESTANDAR',
             estado: 'APROBADO',
-            orden: orden++,
+            rol: 'PUBLICO', // Rol fijo según requerimiento
+            orden: orden++, // 1, 2, 3...
+            usado: false,
           },
         });
       }
     }
 
-    if (stockActual > 0) {
-      // IDEMPOTENCIA: Verificar si ya existe stock para este producto en esta sucursal
-      const existeStock = await tx.stock.findFirst({
-        where: {
-          productoId: producto.id,
-          sucursalId: 1,
-          // Opcional: Podríamos filtrar por lote/vencimiento si quisieras permitir multiples lotes
-        },
-      });
+    // 5. Stock por Sucursal
+    if (p.stockTotal && p.stockTotal.length > 0) {
+      for (const itemStock of p.stockTotal) {
+        const cantidad = itemStock.total || 0;
 
-      if (!existeStock) {
-        // Solo creamos el stock inicial si NO existe inventario previo en esta sucursal
-        await tx.stock.create({
-          data: {
+        // Si la cantidad es 0, decidimos si crear el registro o no.
+        // Generalmente es mejor NO crear registro de stock si es 0 para no llenar la tabla,
+        // pero si tu lógica requiere que exista en 0, quita este if.
+        if (cantidad <= 0) continue;
+
+        const fechaVencimiento = parseDate(itemStock.fechaVencimiento);
+        const sucursalId = itemStock.sucursalId;
+
+        // Verificar si ya existe stock para este producto en esa sucursal
+        const existeStock = await tx.stock.findFirst({
+          where: {
             productoId: producto.id,
-            sucursalId: 1,
-            cantidad: stockActual,
-            cantidadInicial: stockActual, // Asumimos que lo que entra es el inicial de este lote
-            precioCosto: costo,
-            costoTotal: costo * stockActual, // Calculo automático
-            fechaIngreso: new Date(),
-            fechaVencimiento: fechaVencimiento ?? undefined, // null si no tiene
-
-            // Relaciones opcionales dejadas en null (entregaStock, compra, etc)
-            // ya que es una carga inicial "hardcoded".
+            sucursalId: sucursalId,
           },
         });
-        this.logger.debug(
-          `📦 Stock inicial creado: ${stockActual} unids para ${codigoProducto}`,
-        );
-      } else {
-        // Si ya existe, podemos optar por NO hacer nada (seguro) o SUMAR (peligroso en scripts de seed)
-        // Aquí decido no hacer nada para mantener la idempotencia.
-        // Si quisieras actualizar el stock existente, usarías tx.stock.update({...})
+
+        if (!existeStock) {
+          // Crear stock inicial
+          await tx.stock.create({
+            data: {
+              productoId: producto.id,
+              sucursalId: sucursalId,
+              cantidad: cantidad,
+              cantidadInicial: cantidad,
+              precioCosto: Number(costo), // Guardamos el costo histórico del lote
+              costoTotal: Number(costo) * cantidad,
+              fechaIngreso: new Date(),
+              fechaVencimiento: fechaVencimiento ?? undefined,
+            },
+          });
+        } else {
+          // Opcional: Actualizar stock existente si es una recarga
+          // En este script de carga inicial, asumimos que si existe no lo tocamos
+          // o podríamos sumar. Por seguridad, lo dejamos idempotente (no duplica).
+        }
       }
     }
 
@@ -298,12 +272,12 @@ export class PayloadProductosModuleService {
   }
 
   /**
-   * Carga masiva: procesa cada producto en su **propia transacción**.
-   * Devuelve resumen con contadores y errores.
+   * Carga Masiva Principal
    */
   async cargaMasiva() {
-    // Importa tu payload como sea que lo tengas disponible
-    const data: ProductoRaw[] = rawPayloadDataProducts;
+    // Casting forzado porque importamos JSON directo, asegura que TS confíe en la estructura
+    const data: ProductoJsonRaw[] =
+      rawPayloadDataProducts as unknown as ProductoJsonRaw[];
 
     try {
       if (!Array.isArray(data)) {
@@ -313,100 +287,366 @@ export class PayloadProductosModuleService {
       const total = data.length;
       let successCount = 0;
       const createdIds: number[] = [];
-      const failures: Array<{
-        index: number;
-        codigoProducto?: string | null;
-        error: string;
-      }> = [];
+      const failures: any[] = [];
 
-      for (let index = 0; index < data.length; index++) {
+      this.logger.log(`🚀 Iniciando carga masiva de ${total} productos...`);
+
+      // 1. Asegurar Sucursales (Una sola vez antes del bucle)
+      await this.prisma.$transaction(async (tx) => {
+        await this.ensureSucursales(tx);
+      });
+
+      // 2. Procesar Productos
+      for (let index = 0; index < total; index++) {
         const p = data[index];
-        const codigoProducto = trimOrNull(p?.codigoproducto);
+        const codigoRef = p.codigo || `INDEX_${index}`;
 
         try {
           const id = await this.prisma.$transaction(
             async (tx) => {
-              return this.upsertProductoTx(tx, p, 1);
+              return this.upsertProductoTx(tx, p);
             },
-            { timeout: 10000 },
+            { timeout: 10000 }, // Timeout un poco más alto por si hay muchas relaciones
           );
 
           successCount++;
           createdIds.push(id);
-          this.logger.log(
-            `✔️ Producto procesado OK (index=${index}) codigoProducto=${codigoProducto}`,
-          );
+          // Log menos ruidoso, cada 50 items o si falla
+          if (index % 50 === 0) {
+            this.logger.log(`⏳ Procesando... ${index}/${total}`);
+          }
         } catch (err: any) {
-          const msg =
-            err instanceof HttpException
-              ? err.message
-              : err?.message || 'Error desconocido';
-
           failures.push({
             index,
-            codigoProducto,
-            error: msg,
+            codigo: codigoRef,
+            error: err.message,
           });
-
-          this.logger.error(
-            `❌ Falló producto (index=${index}) codigoProducto=${codigoProducto}: ${msg}`,
-            err?.stack,
-          );
+          this.logger.error(`❌ Error en ${codigoRef}: ${err.message}`);
         }
       }
 
-      const failedCount = failures.length;
-
-      const resumen = {
-        total,
-        successCount,
-        failedCount,
-        createdIds,
-        failures,
-      };
-
       this.logger.log(
-        `Resumen carga masiva -> total=${total}, ok=${successCount}, fail=${failedCount}`,
+        `✅ Carga finalizada. OK: ${successCount}, Fail: ${failures.length}`,
       );
 
-      return resumen;
+      return {
+        total,
+        successCount,
+        failedCount: failures.length,
+        failures,
+      };
     } catch (error) {
-      this.logger.error('Error fatal en carga masiva', error?.stack);
-      if (error instanceof HttpException) throw error;
+      this.logger.error('Error fatal en carga masiva', error);
       throw new InternalServerErrorException(
-        'Fatal error: Error inesperado en módulo carga masiva',
+        'Error fatal ejecutando la carga masiva.',
       );
     }
   }
 
-  //Deshacer cambio
+  // --- DELETE ALL (Mismo de antes, solo referencia) ---
   async deleteAllProductos() {
     try {
       await this.prisma.$transaction(async (tx) => {
-        // ⚠️ Ajusta la lista con tus tablas “raíz” que quieres vaciar.
-        // CASCADE limpia dependientes (precios, stock, joins M2M, etc.)
         await tx.$executeRawUnsafe(`
-          TRUNCATE TABLE
-            "Producto",
-            "Categoria",
-            "TipoPresentacion",
-            "StockThreshold"
-          RESTART IDENTITY CASCADE;
+          TRUNCATE TABLE "Producto", "Categoria", "Stock", "PrecioProducto" RESTART IDENTITY CASCADE;
         `);
       });
-
-      this.logger.log('TRUNCATE CASCADE completado (PostgreSQL).');
-      return { ok: true };
+      return { ok: true, message: 'Tablas limpiadas correctamente' };
     } catch (e) {
-      if (e instanceof Prisma.PrismaClientKnownRequestError) {
-        this.logger.error(
-          `Prisma ${e.code} meta=${JSON.stringify(e.meta)}`,
-          e.stack,
-        );
-      } else {
-        this.logger.error('Error en TRUNCATE CASCADE', (e as any)?.stack);
-      }
-      throw e;
+      throw new InternalServerErrorException(e);
     }
   }
+
+  // //retorno producto creado
+  // /**
+  //  * Crea/actualiza 1 producto completo (producto + tipoPresentacion + categorias + precios)
+  //  * en UNA transacción. Retorna el id del producto.
+  //  */
+  // private async upsertProductoTx(
+  //   tx: PrismaClient | Prisma.TransactionClient,
+  //   p: ProductoRaw,
+  //   sucursalId: number,
+  // ): Promise<number> {
+  //   // -------- Validaciones mínimas
+  //   const codigoProducto = trimOrNull(p.codigoproducto);
+  //   const nombre = trimOrNull(p.nombre);
+  //   const descripcion = trimOrNull(p.descripcion);
+  //   const tipoEmpaque = trimOrNull(p.tipoempaque);
+  //   const categorias = splitCategorias(p.categorias);
+  //   const stockMinimo = parseEntero(p.stockminimo, 0);
+  //   let codigoProveedor = normalizeProveedorCode(p.codigoproveedor);
+
+  //   const stockActual = parseEntero(p.stockactual, 0);
+  //   const fechaVencimiento = parseDate(p.stockvencimiento);
+
+  //   if (codigoProveedor) {
+  //     // Optimización: Usar findFirst en lugar de findUnique si codigoProveedor no es @unique en schema
+  //     const holder = await tx.producto.findFirst({
+  //       where: { codigoProveedor },
+  //       select: { id: true, codigoProducto: true },
+  //     });
+
+  //     if (holder && holder.codigoProducto !== codigoProducto) {
+  //       this.logger.warn(
+  //         `codigoProveedor duplicado "${codigoProveedor}" en prod "${codigoProducto}". Pertenece a "${holder.codigoProducto}". Se guardará NULL.`,
+  //       );
+  //       codigoProveedor = null;
+  //     }
+  //   }
+
+  //   if (!codigoProducto) throw new BadRequestException('Falta codigoproducto');
+  //   if (!nombre)
+  //     throw new BadRequestException(`Falta nombre para ${codigoProducto}`);
+
+  //   const costo = parseMoney(p.preciocosto);
+  //   if (costo === null)
+  //     throw new BadRequestException(`Costo inválido para ${codigoProducto}`);
+
+  //   // -------- Upsert del producto base
+  //   const producto = await tx.producto.upsert({
+  //     where: { codigoProducto },
+  //     create: {
+  //       codigoProducto,
+  //       nombre,
+  //       descripcion: descripcion ?? undefined,
+  //       codigoProveedor: codigoProveedor ?? undefined,
+  //       precioCostoActual: costo, // Asegurar Decimal
+  //       stockThreshold: {
+  //         create: { stockMinimo },
+  //       },
+  //     },
+  //     update: {
+  //       nombre,
+  //       descripcion: descripcion ?? undefined,
+  //       // Si codigoProveedor es null, lo desconectamos (set: null) o no hacemos nada
+  //       ...(codigoProveedor !== undefined ? { codigoProveedor } : {}),
+  //       precioCostoActual: costo,
+
+  //       // CORRECCIÓN CRÍTICA 1: Usar upsert anidado para evitar error si ya existe el threshold
+  //       stockThreshold: {
+  //         upsert: {
+  //           create: { stockMinimo },
+  //           update: { stockMinimo },
+  //         },
+  //       },
+  //     },
+  //     select: { id: true },
+  //   });
+
+  //   // -------- Tipo de empaque
+  //   if (tipoEmpaque) {
+  //     await tx.tipoPresentacion.upsert({
+  //       where: { nombre: tipoEmpaque },
+  //       create: {
+  //         nombre: tipoEmpaque,
+  //         activo: true,
+  //         productos: { connect: { id: producto.id } },
+  //       },
+  //       update: {
+  //         productos: { connect: { id: producto.id } },
+  //       },
+  //     });
+  //   }
+
+  //   // -------- Categorías
+  //   if (categorias.length > 0) {
+  //     for (const cat of categorias) {
+  //       await tx.categoria.upsert({
+  //         where: { nombre: cat },
+  //         create: {
+  //           nombre: cat,
+  //           productos: { connect: { id: producto.id } },
+  //         },
+  //         update: {
+  //           productos: { connect: { id: producto.id } },
+  //         },
+  //       });
+  //     }
+  //   }
+
+  //   // -------- Precios
+  //   if (Array.isArray(p.precios) && p.precios.length > 0) {
+  //     await tx.precioProducto.deleteMany({
+  //       where: {
+  //         productoId: producto.id,
+  //         tipo: 'ESTANDAR',
+  //       },
+  //     });
+
+  //     let orden = 1;
+
+  //     for (const pr of p.precios) {
+  //       const valor = parseMoney(pr.precio);
+  //       if (valor === null) {
+  //         this.logger.warn(
+  //           `Precio inválido (${pr.precio}) rol=${pr.rol} producto=${codigoProducto}`,
+  //         );
+  //         continue;
+  //       }
+
+  //       await tx.precioProducto.create({
+  //         data: {
+  //           productoId: producto.id,
+  //           precio: ensurePrecioDecimal(valor),
+  //           rol: pr.rol,
+  //           tipo: 'ESTANDAR',
+  //           estado: 'APROBADO',
+  //           orden: orden++,
+  //         },
+  //       });
+  //     }
+  //   }
+
+  //   if (stockActual > 0) {
+  //     // IDEMPOTENCIA: Verificar si ya existe stock para este producto en esta sucursal
+  //     const existeStock = await tx.stock.findFirst({
+  //       where: {
+  //         productoId: producto.id,
+  //         sucursalId: 1,
+  //         // Opcional: Podríamos filtrar por lote/vencimiento si quisieras permitir multiples lotes
+  //       },
+  //     });
+
+  //     if (!existeStock) {
+  //       // Solo creamos el stock inicial si NO existe inventario previo en esta sucursal
+  //       await tx.stock.create({
+  //         data: {
+  //           productoId: producto.id,
+  //           sucursalId: 1,
+  //           cantidad: stockActual,
+  //           cantidadInicial: stockActual, // Asumimos que lo que entra es el inicial de este lote
+  //           precioCosto: costo,
+  //           costoTotal: costo * stockActual, // Calculo automático
+  //           fechaIngreso: new Date(),
+  //           fechaVencimiento: fechaVencimiento ?? undefined, // null si no tiene
+
+  //           // Relaciones opcionales dejadas en null (entregaStock, compra, etc)
+  //           // ya que es una carga inicial "hardcoded".
+  //         },
+  //       });
+  //       this.logger.debug(
+  //         `📦 Stock inicial creado: ${stockActual} unids para ${codigoProducto}`,
+  //       );
+  //     } else {
+  //       // Si ya existe, podemos optar por NO hacer nada (seguro) o SUMAR (peligroso en scripts de seed)
+  //       // Aquí decido no hacer nada para mantener la idempotencia.
+  //       // Si quisieras actualizar el stock existente, usarías tx.stock.update({...})
+  //     }
+  //   }
+
+  //   return producto.id;
+  // }
+
+  // /**
+  //  * Carga masiva: procesa cada producto en su **propia transacción**.
+  //  * Devuelve resumen con contadores y errores.
+  //  */
+  // async cargaMasiva() {
+  //   // Importa tu payload como sea que lo tengas disponible
+  //   const data: ProductoRaw[] = rawPayloadDataProducts;
+
+  //   try {
+  //     if (!Array.isArray(data)) {
+  //       throw new BadRequestException('Payload inválido: se esperaba un array');
+  //     }
+
+  //     const total = data.length;
+  //     let successCount = 0;
+  //     const createdIds: number[] = [];
+  //     const failures: Array<{
+  //       index: number;
+  //       codigoProducto?: string | null;
+  //       error: string;
+  //     }> = [];
+
+  //     for (let index = 0; index < data.length; index++) {
+  //       const p = data[index];
+  //       const codigoProducto = trimOrNull(p?.codigoproducto);
+
+  //       try {
+  //         const id = await this.prisma.$transaction(
+  //           async (tx) => {
+  //             return this.upsertProductoTx(tx, p, 1);
+  //           },
+  //           { timeout: 10000 },
+  //         );
+
+  //         successCount++;
+  //         createdIds.push(id);
+  //         this.logger.log(
+  //           `✔️ Producto procesado OK (index=${index}) codigoProducto=${codigoProducto}`,
+  //         );
+  //       } catch (err: any) {
+  //         const msg =
+  //           err instanceof HttpException
+  //             ? err.message
+  //             : err?.message || 'Error desconocido';
+
+  //         failures.push({
+  //           index,
+  //           codigoProducto,
+  //           error: msg,
+  //         });
+
+  //         this.logger.error(
+  //           `❌ Falló producto (index=${index}) codigoProducto=${codigoProducto}: ${msg}`,
+  //           err?.stack,
+  //         );
+  //       }
+  //     }
+
+  //     const failedCount = failures.length;
+
+  //     const resumen = {
+  //       total,
+  //       successCount,
+  //       failedCount,
+  //       createdIds,
+  //       failures,
+  //     };
+
+  //     this.logger.log(
+  //       `Resumen carga masiva -> total=${total}, ok=${successCount}, fail=${failedCount}`,
+  //     );
+
+  //     return resumen;
+  //   } catch (error) {
+  //     this.logger.error('Error fatal en carga masiva', error?.stack);
+  //     if (error instanceof HttpException) throw error;
+  //     throw new InternalServerErrorException(
+  //       'Fatal error: Error inesperado en módulo carga masiva',
+  //     );
+  //   }
+  // }
+
+  // //Deshacer cambio
+  // async deleteAllProductos() {
+  //   try {
+  //     await this.prisma.$transaction(async (tx) => {
+  //       // ⚠️ Ajusta la lista con tus tablas “raíz” que quieres vaciar.
+  //       // CASCADE limpia dependientes (precios, stock, joins M2M, etc.)
+  //       await tx.$executeRawUnsafe(`
+  //         TRUNCATE TABLE
+  //           "Producto",
+  //           "Categoria",
+  //           "TipoPresentacion",
+  //           "StockThreshold"
+  //         RESTART IDENTITY CASCADE;
+  //       `);
+  //     });
+
+  //     this.logger.log('TRUNCATE CASCADE completado (PostgreSQL).');
+  //     return { ok: true };
+  //   } catch (e) {
+  //     if (e instanceof Prisma.PrismaClientKnownRequestError) {
+  //       this.logger.error(
+  //         `Prisma ${e.code} meta=${JSON.stringify(e.meta)}`,
+  //         e.stack,
+  //       );
+  //     } else {
+  //       this.logger.error('Error en TRUNCATE CASCADE', (e as any)?.stack);
+  //     }
+  //     throw e;
+  //   }
+  // }
 }
