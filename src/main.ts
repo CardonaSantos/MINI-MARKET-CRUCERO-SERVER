@@ -6,7 +6,11 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   // comentario
   app.enableCors({
-    origin: ['https://nova-pos-erp.up.railway.app'],
+    origin: [
+      'https://nova-pos-erp.up.railway.app',
+      'http://localhost:5174',
+      'http://localhost:5173',
+    ],
     credentials: true, // <- para cookies/withCredentials
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],

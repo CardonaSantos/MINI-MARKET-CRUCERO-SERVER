@@ -43,14 +43,20 @@ export class ClientService {
   ) {
     try {
       // Normalizar y validar
-      const dpi = normalizeDpi(createClientDto.dpi);
-      const nit = normalizeNit(createClientDto.nit);
-      ensureOneDoc(dpi, nit);
+      // const dpi = normalizeDpi(createClientDto.dpi);
+      // const nit = normalizeNit(createClientDto.nit);
+      // ensureOneDoc(dpi, nit);
 
-      if (dpi && !isValidDpi(dpi))
-        throw new BadRequestException('DPI inválido.');
-      if (nit && !isValidNit(nit))
-        throw new BadRequestException('NIT inválido.');
+      const rawDpi = (createClientDto.dpi || '').trim();
+      const rawNit = (createClientDto.nit || '').trim();
+
+      const dpi = rawDpi === '' ? null : rawDpi;
+      const nit = rawNit === '' ? null : rawNit;
+
+      // if (dpi && !isValidDpi(dpi))
+      //   throw new BadRequestException('DPI inválido.');
+      // if (nit && !isValidNit(nit))
+      //   throw new BadRequestException('NIT inválido.');
 
       const nombre = (createClientDto.nombre ?? '').trim();
       if (!nombre) throw new BadRequestException('El nombre es obligatorio.');
@@ -60,12 +66,19 @@ export class ClientService {
       const client = await db.cliente.create({
         data: {
           nombre,
-          apellidos: nullIfEmpty(createClientDto.apellidos),
-          telefono: nullIfEmpty(createClientDto.telefono),
-          direccion: nullIfEmpty(createClientDto.direccion),
-          observaciones: nullIfEmpty(createClientDto.observaciones),
-          dpi, // null o string validado
-          nit, // null o string validado
+          apellidos: createClientDto.apellidos
+            ? createClientDto.apellidos
+            : null,
+          telefono: createClientDto.telefono ? createClientDto.telefono : null,
+          direccion: createClientDto.direccion
+            ? createClientDto.direccion
+            : null,
+          observaciones: createClientDto.observaciones
+            ? createClientDto.observaciones
+            : null,
+
+          dpi: dpi,
+          nit: nit,
         },
       });
 
