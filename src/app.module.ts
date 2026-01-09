@@ -77,6 +77,7 @@ import { TipoPresentacionModule } from './tipo-presentacion/tipo-presentacion.mo
 import { CuotasMoraCronModule } from './cuotas-mora-cron/cuotas-mora-cron.module';
 import { ProrrateoModule } from './prorrateo/prorrateo.module';
 import { PayloadProductosModuleModule } from './payload-productos-module/payload-productos-module.module';
+import { BotFunctionsModule } from './bot-functions/bot-functions.module';
 
 @Module({
   imports: [
@@ -156,6 +157,7 @@ import { PayloadProductosModuleModule } from './payload-productos-module/payload
     CuotasMoraCronModule,
     ProrrateoModule,
     PayloadProductosModuleModule,
+    BotFunctionsModule,
   ],
   controllers: [AppController],
   providers: [AppService, CloudinaryProvider, SaldosServiceService],
