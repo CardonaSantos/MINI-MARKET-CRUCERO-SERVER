@@ -38,6 +38,6 @@ export class BotFunctionsController {
       throw new UnauthorizedException('TOKEN NO AUTORIZADO');
     }
 
-    return this.botFunctionsService.makeSearchProducts(dto);
+    return this.botFunctionsService.search(dto);
   }
 }
