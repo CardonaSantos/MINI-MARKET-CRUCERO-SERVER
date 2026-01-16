@@ -7,7 +7,7 @@ async function bootstrap() {
   // comentario
   app.enableCors({
     origin: [
-      'https://mini-market-crucero.up.railway.app',
+      'https://mini-market.up.railway.app',
       'http://localhost:5174',
       'http://localhost:5173',
     ],
